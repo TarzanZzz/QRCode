@@ -1,0 +1,7 @@
+#ifndef _CVI_RTSP_
+#define _CVI_RTSP_
+
+int start_rtsp_server(int *VencChn, int num);
+void stop_rtsp_server(int *VencChn, int num);
+
+#endif

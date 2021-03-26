@@ -1,0 +1,170 @@
+#include <pthread.h>
+#include <sys/prctl.h>
+#include <cvi_venc.h>
+#include <rtsp.h>
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "cvi_rtsp.h"
+
+static CVI_RTSP_CTX *ctx;
+static CVI_RTSP_SESSION *session[2];
+static pthread_t pthRtsp[2];
+static bool bRun;
+
+void connect(const char *ip, void *arg)
+{
+    printf("rtsp connect: %s\n", ip );
+}
+
+void disconnect(const char *ip, void *arg)
+{
+   printf( "rtsp disconnect: %s\n",ip);
+}
+
+
+void SendToRtsp(CVI_RTSP_CTX *ctx, CVI_RTSP_SESSION *session, VENC_STREAM_S *pstStream)
+{
+	CVI_S32 s32Ret = CVI_SUCCESS;
+	VENC_PACK_S *ppack;
+	CVI_RTSP_DATA data;
+
+	memset(&data, 0, sizeof(CVI_RTSP_DATA));
+
+	data.blockCnt = pstStream->u32PackCount;
+	for (CVI_U32 i = 0; i < pstStream->u32PackCount; i++) {
+		ppack = &pstStream->pstPack[i];
+		data.dataPtr[i] = ppack->pu8Addr + ppack->u32Offset;
+		data.dataLen[i] = ppack->u32Len - ppack->u32Offset;
+	}
+
+	s32Ret = CVI_RTSP_WriteFrame(ctx, session->video, &data);
+	if (s32Ret != CVI_SUCCESS) {
+		printf("CVI_RTSP_WriteFrame failed\n");
+	}
+}
+
+static CVI_VOID *GetVencStreamProc(CVI_VOID *pArgs)
+{
+	VENC_CHN VencChn = *((VENC_CHN *)pArgs);
+	CVI_CHAR TaskName[64];
+	CVI_S32 s32Ret, i = 0;
+    VENC_CHN_STATUS_S stStat;
+    VENC_STREAM_S stStream;
+	sprintf(TaskName, "chn%dVencGetStream", VencChn);
+	prctl(PR_SET_NAME, TaskName, 0, 0, 0);
+	printf("venc task%d start\n", VencChn);
+
+	while (bRun) {
+        s32Ret = CVI_VENC_QueryStatus(VencChn, &stStat);
+        if (s32Ret != CVI_SUCCESS) {
+            printf("CVI_VENC_QueryStatus, Vench = %d, s32Ret = %d\n",
+                    VencChn, s32Ret);
+            break;
+        }
+
+        if (!stStat.u32CurPacks) {
+            usleep(10000);
+            continue;
+        }
+
+        stStream.pstPack =
+            (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * stStat.u32CurPacks);
+        if (stStream.pstPack == NULL) {
+            printf("malloc memory failed!\n");
+            break;
+        }
+
+        //CVI_SYS_TraceBegin("VENC_GetStream");
+        s32Ret = CVI_VENC_GetStream(VencChn, &stStream, -1);
+        if (s32Ret != CVI_SUCCESS) {
+            printf("CVI_VENC_GetStream, VencChn = %d, s32Ret = 0x%X\n",
+                    VencChn, s32Ret);
+            free(stStream.pstPack);
+            stStream.pstPack = NULL;
+            break;
+        }
+        //CVI_SYS_TraceEnd();
+        SendToRtsp(ctx, session[VencChn], &stStream);
+        s32Ret = CVI_VENC_ReleaseStream(VencChn, &stStream);
+        if (s32Ret != CVI_SUCCESS) {
+            printf("CVI_VENC_ReleaseStream, s32Ret = %d\n", s32Ret);
+            free(stStream.pstPack);
+            stStream.pstPack = NULL;
+            break;
+        }
+        free(stStream.pstPack);
+        stStream.pstPack = NULL;
+    }
+	printf("venc task%d end\n", VencChn);
+
+	return (CVI_VOID *) CVI_SUCCESS;
+}
+
+
+int start_rtsp_server(int *VencChn, int num)
+{
+    CVI_RTSP_CONFIG config;
+    config.port = 8554;
+    CVI_S32 s32Ret = CVI_SUCCESS;
+
+    if (num < 1) {
+        printf("VencChn num=0\n");
+        return -1;
+    }
+    if (!VencChn) {
+        printf("NULL Pointer\n");
+        return -1;
+    }
+
+    if (0 > CVI_RTSP_Create(&ctx, &config)) {
+        printf("fail to create rtsp contex\n");
+        return -1;
+    }
+
+    // set listener
+    CVI_RTSP_STATE_LISTENER listener = {0};
+    listener.onConnect = connect;
+    listener.argConn = ctx;
+    listener.onDisconnect = disconnect;
+    CVI_RTSP_SetListener(ctx, &listener);
+
+    if (0 > CVI_RTSP_Start(ctx)) {
+        printf("fail to start\n");
+        return -1;
+    }
+
+    for (int i = 0; i < num; i++) {
+        CVI_RTSP_SESSION_ATTR attr = {0};
+        attr.video.codec = RTSP_VIDEO_H264;
+        snprintf(attr.name, sizeof(attr.name), "live%d", i);
+        CVI_RTSP_CreateSession(ctx, &attr, &session[i]);
+    }
+
+    bRun = true;
+    for (int i = 0; i < num; i++) {
+        s32Ret = pthread_create(&pthRtsp[i], NULL, GetVencStreamProc, (void *)&VencChn[i]);
+        if (s32Ret) {
+            printf("[Chn %d]pthread_create failed\n", i);
+            return CVI_FAILURE;
+        }
+    }
+    printf("start rtsp server\n");
+
+    return 0;
+}
+
+void stop_rtsp_server(int *VencChn, int num)
+{
+    bRun = false;
+    for (int i = 0; i < num; i++)
+        pthread_join(pthRtsp[i], NULL);
+
+    CVI_RTSP_Stop(ctx);
+    for (int i = 0; i < num; i++) 
+        CVI_RTSP_DestroySession(ctx, session[i]);
+
+    CVI_RTSP_Destroy(&ctx);
+    printf("stop rtsp server\n");
+}
